@@ -1,24 +1,7 @@
-"""
-Executive Data Analyzer Pro
-A local-first Streamlit app for exploratory analysis and management reporting.
-
-Run:
-    pip install -r requirements.txt
-    streamlit run executive_data_analyzer.py
-
-Notes:
-- Core analysis runs locally; data is not sent to an AI provider.
-- Optional Gemini narrative generation sends aggregated statistics and a
-  bounded sample of the data profile, not the full raw dataset.
-"""
-
 from __future__ import annotations
 
 import io
-import json
-import math
-import re
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -27,879 +10,577 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-
-# ---------------------------------------------------------------------------
-# Page setup and visual defaults
-# ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Executive Data Analyzer Pro",
+    page_title="Executive Data Analyzer",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-CUSTOM_CSS = """
+# ------------------------------ Styling -------------------------------------
+st.markdown("""
 <style>
-    .block-container {padding-top: 1.5rem; padding-bottom: 2.5rem;}
-    [data-testid="stMetric"] {
-        background: rgba(128,128,128,0.07);
-        border: 1px solid rgba(128,128,128,0.18);
-        padding: 14px 16px;
-        border-radius: 12px;
-    }
-    .insight-card {
-        border: 1px solid rgba(128,128,128,0.22);
-        border-radius: 12px;
-        padding: 14px 16px;
-        margin: 8px 0;
-    }
-    .small-muted {font-size: 0.88rem; opacity: 0.75;}
+.block-container {padding-top: 1.2rem; padding-bottom: 2.5rem; max-width: 1400px;}
+.hero {padding: 1.25rem 1.5rem; border-radius: 16px;
+       background: linear-gradient(120deg,#101b32,#142c4c); border:1px solid #244665;}
+.hero h1 {margin:0; color:#f4f7fb; font-size:2rem;}
+.hero p {margin:.45rem 0 0; color:#a9bed1;}
+.step-card {background:rgba(60,190,210,.07); border:1px solid rgba(60,190,210,.3);
+            border-radius:12px; padding:14px; min-height:100px;}
+.kpi {background:#101b32; border:1px solid #244665; border-radius:12px; padding:12px;}
+.kpi-label {font-size:.75rem;color:#9bb0c5;text-transform:uppercase;letter-spacing:.04em;}
+.kpi-value {font-size:1.55rem;color:#43d5e6;font-weight:750;}
+.kpi-note {font-size:.72rem;color:#9bb0c5;}
+div[data-testid="stMetric"] {background:#101b32;border:1px solid #244665;padding:12px;border-radius:12px;}
 </style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-st.title("📊 Executive Data Analyzer Pro")
-st.caption(
-    "Local-first data analysis for faster diagnosis, clearer insights, "
-    "decision-oriented visualizations, and management-ready reporting."
-)
+st.markdown("""
+<div class="hero">
+  <h1>📊 Executive Data Analyzer</h1>
+  <p>Upload data → pilih pertanyaan → dapatkan insight → unduh laporan eksekutif.</p>
+</div>
+""", unsafe_allow_html=True)
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def safe_number(value: Any, digits: int = 2) -> str:
-    """Format numeric values without displaying NaN or infinity."""
+# ------------------------------ Helpers -------------------------------------
+def fmt_num(v: Any, digits: int = 1) -> str:
     try:
-        if pd.isna(value) or not np.isfinite(float(value)):
+        if pd.isna(v):
             return "—"
-        value = float(value)
-        if abs(value) >= 1_000_000_000:
-            return f"{value / 1_000_000_000:,.{digits}f}B"
-        if abs(value) >= 1_000_000:
-            return f"{value / 1_000_000:,.{digits}f}M"
-        if abs(value) >= 1_000:
-            return f"{value:,.{digits}f}"
-        return f"{value:,.{digits}f}"
-    except (TypeError, ValueError):
-        return str(value)
+        x = float(v)
+        if abs(x) >= 1_000_000_000: return f"{x/1_000_000_000:,.{digits}f}B"
+        if abs(x) >= 1_000_000: return f"{x/1_000_000:,.{digits}f}M"
+        if abs(x) >= 1_000: return f"{x:,.{digits}f}"
+        return f"{x:,.{digits}f}"
+    except Exception:
+        return str(v)
 
-
-def pct(value: float, digits: int = 1) -> str:
-    return f"{value:.{digits}f}%"
-
-
-def infer_date_columns(df: pd.DataFrame) -> list[str]:
-    """Detect datetime columns and object columns that parse reliably as dates."""
-    found = list(df.select_dtypes(include=["datetime", "datetimetz"]).columns)
-    for col in df.select_dtypes(include=["object", "string"]).columns:
-        sample = df[col].dropna().astype(str).head(300)
-        if len(sample) < 3:
-            continue
-        parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
-        if parsed.notna().mean() >= 0.85:
-            found.append(col)
+def infer_dates(frame: pd.DataFrame) -> list[str]:
+    found = list(frame.select_dtypes(include=["datetime", "datetimetz"]).columns)
+    for col in frame.select_dtypes(include=["object", "string"]).columns:
+        sample = frame[col].dropna().astype(str).head(100)
+        if len(sample) >= 5:
+            parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
+            if parsed.notna().mean() >= .85:
+                found.append(col)
     return list(dict.fromkeys(found))
 
+def read_upload(file, sheet=None):
+    if file.name.lower().endswith(".csv"):
+        try:
+            return pd.read_csv(file)
+        except UnicodeDecodeError:
+            file.seek(0)
+            return pd.read_csv(file, encoding="latin-1")
+    return pd.read_excel(file, sheet_name=sheet)
 
-def coerce_date_column(df: pd.DataFrame, col: str) -> pd.Series:
-    return pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+def category_summary(frame: pd.DataFrame, col: str, top_n: int = 6):
+    s = frame[col].dropna().astype(str)
+    if s.empty:
+        return pd.DataFrame(columns=["Kategori", "Jumlah", "Persentase"])
+    counts = s.value_counts().head(top_n)
+    denominator = max(len(s), 1)
+    return pd.DataFrame({
+        "Kategori": counts.index.astype(str),
+        "Jumlah": counts.values,
+        "Persentase": counts.values / denominator * 100,
+    })
 
+def numeric_summary(frame: pd.DataFrame, col: str):
+    s = pd.to_numeric(frame[col], errors="coerce").dropna()
+    if s.empty:
+        return None
+    return {
+        "count": len(s), "sum": s.sum(), "mean": s.mean(), "median": s.median(),
+        "min": s.min(), "max": s.max(), "std": s.std(),
+    }
 
-def get_column_types(df: pd.DataFrame):
-    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
-    categorical = df.select_dtypes(include=["object", "category", "string", "bool"]).columns.tolist()
-    dates = infer_date_columns(df)
-    return numeric, categorical, dates
-
-
-def data_quality_report(df: pd.DataFrame) -> pd.DataFrame:
+def quality_profile(frame: pd.DataFrame):
+    n = max(len(frame), 1)
     rows = []
-    total = max(len(df), 1)
-    for col in df.columns:
-        missing = int(df[col].isna().sum())
-        unique = int(df[col].nunique(dropna=True))
+    for col in frame.columns:
         rows.append({
             "Kolom": str(col),
-            "Tipe Data": str(df[col].dtype),
-            "Missing": missing,
-            "Missing (%)": round(missing / total * 100, 2),
-            "Unique Values": unique,
-            "Unique (%)": round(unique / total * 100, 2),
+            "Tipe": str(frame[col].dtype),
+            "Kosong": int(frame[col].isna().sum()),
+            "Kosong (%)": frame[col].isna().mean() * 100,
+            "Nilai unik": int(frame[col].nunique(dropna=True)),
         })
     return pd.DataFrame(rows)
 
+def build_pdf(frame, report_title, selected_categories, primary_metric):
+    """Build a compact, dark editorial dashboard PDF using ReportLab Platypus."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Flowable, KeepTogether
+    )
 
-def numeric_profile(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
-    if not numeric_cols:
-        return pd.DataFrame()
-    result = df[numeric_cols].describe().T
-    result["median"] = df[numeric_cols].median()
-    result["sum"] = df[numeric_cols].sum(min_count=1)
-    result["missing"] = df[numeric_cols].isna().sum()
-    result["missing_pct"] = df[numeric_cols].isna().mean() * 100
-    result["zero_count"] = (df[numeric_cols] == 0).sum()
-    return result.rename_axis("Metrik").reset_index()
+    NAVY = colors.HexColor("#0B1425")
+    PANEL = colors.HexColor("#111F35")
+    PANEL2 = colors.HexColor("#172943")
+    CYAN = colors.HexColor("#32D5E7")
+    WHITE = colors.HexColor("#F3F6FA")
+    MUTED = colors.HexColor("#A7B8CB")
+    GRID = colors.HexColor("#29415D")
+    GREEN = colors.HexColor("#58D6B0")
 
+    class BarRows(Flowable):
+        def __init__(self, data, width, height=86):
+            Flowable.__init__(self)
+            self.data, self.width, self.height = data, width, height
+        def wrap(self, aw, ah):
+            return self.width, self.height
+        def draw(self):
+            c = self.canv
+            if not self.data:
+                c.setFillColor(MUTED); c.setFont("Helvetica", 7)
+                c.drawString(0, self.height-12, "Tidak ada nilai tersedia")
+                return
+            row_h = min(15, self.height / max(len(self.data), 1))
+            max_v = max([x[1] for x in self.data] + [1])
+            for i, (label, value, share) in enumerate(self.data):
+                y = self.height - (i+1)*row_h + 2
+                c.setFillColor(WHITE); c.setFont("Helvetica", 6.4)
+                shown = label if len(label) <= 20 else label[:18] + "…"
+                c.drawString(0, y+3, shown)
+                bx = self.width * .48
+                bw = self.width * .34
+                c.setFillColor(GRID); c.roundRect(bx, y+2, bw, 5, 2, fill=1, stroke=0)
+                c.setFillColor(CYAN); c.roundRect(bx, y+2, bw*float(value)/max_v, 5, 2, fill=1, stroke=0)
+                c.setFillColor(CYAN); c.setFont("Helvetica-Bold", 6.4)
+                c.drawRightString(self.width, y+3, f"{share:.1f}%")
 
-def calculate_outliers(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
-    rows = []
-    n = len(df)
-    for col in numeric_cols:
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if series.empty:
-            continue
-        q1, q3 = series.quantile([0.25, 0.75])
-        iqr = q3 - q1
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        count = int(((series < lower) | (series > upper)).sum())
-        rows.append({
-            "Metrik": col,
-            "Q1": q1,
-            "Median": series.median(),
-            "Q3": q3,
-            "Batas Bawah IQR": lower,
-            "Batas Atas IQR": upper,
-            "Outlier": count,
-            "Outlier (%)": count / max(len(series), 1) * 100,
-            "Valid N": len(series),
-        })
-    return pd.DataFrame(rows)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleX", parent=styles["Title"], fontName="Helvetica-Bold",
+                                 fontSize=17, leading=20, textColor=WHITE, alignment=TA_LEFT, spaceAfter=2)
+    sub_style = ParagraphStyle("SubX", parent=styles["Normal"], fontSize=7.5, leading=10,
+                               textColor=MUTED, spaceAfter=5)
+    section_style = ParagraphStyle("SectionX", parent=styles["Heading2"], fontName="Helvetica-Bold",
+                                   fontSize=8.5, leading=11, textColor=CYAN, spaceBefore=4, spaceAfter=5)
+    card_title = ParagraphStyle("CardTitleX", parent=styles["Normal"], fontName="Helvetica-Bold",
+                                fontSize=7.3, leading=9, textColor=WHITE)
+    body_style = ParagraphStyle("BodyX", parent=styles["Normal"], fontSize=7, leading=9,
+                                textColor=WHITE)
+    muted_style = ParagraphStyle("MutedX", parent=styles["Normal"], fontSize=6.2, leading=8,
+                                 textColor=MUTED)
+    kpi_value = ParagraphStyle("KpiValueX", parent=styles["Normal"], fontName="Helvetica-Bold",
+                               fontSize=15, leading=17, textColor=CYAN)
+    kpi_label = ParagraphStyle("KpiLabelX", parent=styles["Normal"], fontSize=6.2, leading=8,
+                               textColor=MUTED)
 
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=12*mm, leftMargin=12*mm,
+                            topMargin=10*mm, bottomMargin=10*mm, title=report_title)
+    usable = A4[0] - 24*mm
+    story = []
 
-def top_category_insight(df: pd.DataFrame, cat_col: str, metric_col: str, agg: str):
-    work = df[[cat_col, metric_col]].dropna()
-    if work.empty:
-        return None, pd.DataFrame()
-    if agg == "Sum":
-        grouped = work.groupby(cat_col, dropna=False)[metric_col].sum()
-    elif agg == "Mean":
-        grouped = work.groupby(cat_col, dropna=False)[metric_col].mean()
+    def page_bg(canvas, doc_obj):
+        canvas.saveState()
+        canvas.setFillColor(NAVY)
+        canvas.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
+        canvas.setStrokeColor(GRID)
+        canvas.setLineWidth(.5)
+        canvas.line(12*mm, A4[1]-27*mm, A4[0]-12*mm, A4[1]-27*mm)
+        canvas.setFillColor(MUTED); canvas.setFont("Helvetica", 6)
+        canvas.drawString(12*mm, 6*mm, "EXECUTIVE DATA ANALYZER  •  GENERATED REPORT")
+        canvas.drawRightString(A4[0]-12*mm, 6*mm, f"Page {doc_obj.page}")
+        canvas.restoreState()
+
+    story.append(Paragraph(report_title, title_style))
+    story.append(Paragraph(
+        f"Dataset: {len(frame):,} records · {len(frame.columns):,} variables · "
+        f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')}", sub_style
+    ))
+
+    missing = int(frame.isna().sum().sum())
+    dup = int(frame.duplicated().sum())
+    kpis = [
+        ("TOTAL RESPONDEN / RECORDS", f"{len(frame):,}", "Basis data yang dianalisis"),
+        ("TOTAL VARIABLES", f"{len(frame.columns):,}", "Kolom dalam dataset"),
+        ("MISSING CELLS", f"{missing:,}", f"{missing/max(frame.size,1)*100:.1f}% dari seluruh sel"),
+        ("DUPLICATE ROWS", f"{dup:,}", "Baris identik"),
+    ]
+    kpi_cells = []
+    for label, value, note in kpis:
+        kpi_cells.append([
+            Paragraph(label, kpi_label), Paragraph(value, kpi_value),
+            Paragraph(note, muted_style)
+        ])
+    kpi_table = Table([[Table(cell, colWidths=[usable/4-8], rowHeights=None) for cell in kpi_cells]],
+                      colWidths=[usable/4]*4)
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1),PANEL),("BOX",(0,0),(-1,-1),.5,GRID),
+        ("INNERGRID",(0,0),(-1,-1),.5,GRID),("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("LEFTPADDING",(0,0),(-1,-1),7),("RIGHTPADDING",(0,0),(-1,-1),5),
+        ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),
+    ]))
+    story += [kpi_table, Spacer(1, 5), Paragraph("AUDIENCE & DATA PROFILE", section_style)]
+
+    cats = selected_categories[:6]
+    if not cats:
+        cats = [c for c in frame.select_dtypes(include=["object","category","string","bool"]).columns][:6]
+    card_width = (usable - 10) / 3
+    card_tables = []
+    for col in cats:
+        summary = category_summary(frame, col, 5)
+        data = [(str(r["Kategori"]), float(r["Jumlah"]), float(r["Persentase"]))
+                for _, r in summary.iterrows()]
+        chart = BarRows(data, card_width-14, height=74)
+        card = Table([
+            [Paragraph(str(col).upper(), card_title)],
+            [Paragraph(f"{int(frame[col].notna().sum()):,} valid responses", muted_style)],
+            [chart],
+        ], colWidths=[card_width-8])
+        card.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,-1),PANEL),("BOX",(0,0),(-1,-1),.6,GRID),
+            ("LEFTPADDING",(0,0),(-1,-1),7),("RIGHTPADDING",(0,0),(-1,-1),7),
+            ("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),5),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+        ]))
+        card_tables.append(card)
+    if card_tables:
+        while len(card_tables) % 3:
+            card_tables.append(Paragraph("", body_style))
+        for i in range(0, len(card_tables), 3):
+            row = Table([[card_tables[i], card_tables[i+1], card_tables[i+2]]],
+                        colWidths=[card_width]*3)
+            row.setStyle(TableStyle([
+                ("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),0),
+                ("RIGHTPADDING",(0,0),(-1,-1),3),("TOPPADDING",(0,0),(-1,-1),2),
+                ("BOTTOMPADDING",(0,0),(-1,-1),3),
+            ]))
+            story.append(row)
     else:
-        grouped = work.groupby(cat_col, dropna=False)[metric_col].count()
-    grouped = grouped.sort_values(ascending=False)
-    return (grouped.index[0], grouped.iloc[0]), grouped.rename("value").reset_index()
+        story.append(Paragraph("Tidak ditemukan kolom kategori untuk profil distribusi.", muted_style))
+
+    if primary_metric and primary_metric in frame.columns:
+        stats = numeric_summary(frame, primary_metric)
+        if stats:
+            story += [Spacer(1, 4), Paragraph("KEY METRIC PERFORMANCE", section_style)]
+            metric_cells = [
+                [Paragraph(primary_metric, card_title), Paragraph("TOTAL", kpi_label),
+                 Paragraph("AVERAGE", kpi_label), Paragraph("MEDIAN", kpi_label),
+                 Paragraph("MIN – MAX", kpi_label)],
+                [Paragraph("Selected metric", muted_style),
+                 Paragraph(fmt_num(stats["sum"]), kpi_value),
+                 Paragraph(fmt_num(stats["mean"]), kpi_value),
+                 Paragraph(fmt_num(stats["median"]), kpi_value),
+                 Paragraph(f"{fmt_num(stats['min'])} – {fmt_num(stats['max'])}", body_style)],
+            ]
+            mt = Table(metric_cells, colWidths=[usable*.22, usable*.19, usable*.19, usable*.19, usable*.21])
+            mt.setStyle(TableStyle([
+                ("BACKGROUND",(0,0),(-1,-1),PANEL),("BOX",(0,0),(-1,-1),.5,GRID),
+                ("INNERGRID",(0,0),(-1,-1),.4,GRID),("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+                ("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),4),
+                ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+            ]))
+            story.append(mt)
+
+    story += [Spacer(1, 5), Paragraph("EXECUTIVE SIGNALS", section_style)]
+    signals = []
+    if len(frame):
+        signals.append(f"Dataset mencakup <b>{len(frame):,} records</b> dan <b>{len(frame.columns)} variables</b>.")
+    if missing:
+        signals.append(f"Ada <b>{missing:,} missing cells</b> ({missing/max(frame.size,1)*100:.1f}%); periksa kolom dengan tingkat missing tertinggi.")
+    else:
+        signals.append("Tidak ditemukan missing cells pada dataset yang dianalisis.")
+    if dup:
+        signals.append(f"Ditemukan <b>{dup:,} duplicate rows</b>; validasi apakah merupakan duplikasi aktual atau observasi yang sah.")
+    else:
+        signals.append("Tidak ditemukan baris duplikat identik.")
+    for col in cats[:3]:
+        summ = category_summary(frame, col, 1)
+        if not summ.empty:
+            r = summ.iloc[0]
+            signals.append(f"Pada <b>{col}</b>, kategori terbesar adalah <b>{r['Kategori']}</b> ({r['Persentase']:.1f}%).")
+    if primary_metric and primary_metric in frame.columns:
+        s = numeric_summary(frame, primary_metric)
+        if s:
+            signals.append(f"Metrik <b>{primary_metric}</b>: total {fmt_num(s['sum'])}, rata-rata {fmt_num(s['mean'])}, median {fmt_num(s['median'])}.")
+    signal_table = Table([[Paragraph("• " + x, body_style)] for x in signals[:6]], colWidths=[usable])
+    signal_table.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1),PANEL2),("BOX",(0,0),(-1,-1),.6,GRID),
+        ("LINEBEFORE",(0,0),(0,-1),2,CYAN),("LEFTPADDING",(0,0),(-1,-1),9),
+        ("RIGHTPADDING",(0,0),(-1,-1),7),("TOPPADDING",(0,0),(-1,-1),4),
+        ("BOTTOMPADDING",(0,0),(-1,-1),4),
+    ]))
+    story.append(signal_table)
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        "Interpretation note: hasil ini bersifat deskriptif. Distribusi dan korelasi tidak membuktikan sebab-akibat. "
+        "Validasi definisi variabel, representativitas sampel, dan konteks operasional sebelum keputusan.",
+        muted_style
+    ))
+    doc.build(story, onFirstPage=page_bg, onLaterPages=page_bg)
+    return buffer.getvalue()
 
 
-def build_rule_based_summary(df: pd.DataFrame, raw_df: pd.DataFrame,
-                             numeric_cols: list[str], categorical_cols: list[str],
-                             date_cols: list[str], selected_metric: str | None):
-    lines = []
-    n_rows, n_cols = df.shape
-    missing_cells = int(df.isna().sum().sum())
-    missing_pct = missing_cells / max(n_rows * n_cols, 1) * 100
-    duplicate_rows = int(df.duplicated().sum())
-    filtered_share = n_rows / max(len(raw_df), 1) * 100
-
-    lines.append(
-        f"Dataset yang dianalisis berisi **{n_rows:,} baris dan {n_cols:,} kolom** "
-        f"({filtered_share:.1f}% dari data awal setelah filter)."
-    )
-    lines.append(
-        f"Kualitas data: **{missing_cells:,} sel kosong ({missing_pct:.2f}%)** "
-        f"dan **{duplicate_rows:,} baris duplikat**."
-    )
-
-    if n_rows == 0:
-        lines.append("Tidak ada baris yang tersisa setelah filter. Ubah filter sebelum menarik kesimpulan.")
-        return lines
-
-    if selected_metric and selected_metric in numeric_cols:
-        s = pd.to_numeric(df[selected_metric], errors="coerce").dropna()
-        if len(s):
-            lines.append(
-                f"Metrik utama **{selected_metric}** memiliki total **{safe_number(s.sum())}**, "
-                f"rata-rata **{safe_number(s.mean())}**, median **{safe_number(s.median())}**, "
-                f"dan rentang **{safe_number(s.min())}–{safe_number(s.max())}** "
-                f"(berdasarkan {len(s):,} nilai valid)."
-            )
-            if s.mean() != 0:
-                cv = s.std() / abs(s.mean()) * 100 if len(s) > 1 else 0
-                lines.append(
-                    f"Variasi relatif metrik (coefficient of variation) sekitar **{cv:.1f}%**. "
-                    "Nilai ini membantu membaca konsistensi, tetapi tidak menjelaskan penyebab variasi."
-                )
-
-    if categorical_cols and numeric_cols:
-        cat_col = categorical_cols[0]
-        metric_col = selected_metric if selected_metric in numeric_cols else numeric_cols[0]
-        top, grouped = top_category_insight(df, cat_col, metric_col, "Sum")
-        if top is not None:
-            total = grouped["value"].sum()
-            share = top[1] / total * 100 if total else np.nan
-            lines.append(
-                f"Pada **{cat_col}**, kontributor terbesar terhadap total **{metric_col}** "
-                f"adalah **{top[0]}** dengan nilai **{safe_number(top[1])}**"
-                + (f" (sekitar {share:.1f}% dari total kategori)." if pd.notna(share) else ".")
-            )
-
-    if date_cols:
-        date_col = date_cols[0]
-        dates = coerce_date_column(df, date_col).dropna()
-        if len(dates):
-            lines.append(
-                f"Rentang waktu pada **{date_col}** adalah **{dates.min().date()} hingga "
-                f"{dates.max().date()}** ({len(dates):,} tanggal valid)."
-            )
-
-    return lines
-
-
-def make_markdown_report(df: pd.DataFrame, summary_lines: list[str],
-                         quality_df: pd.DataFrame, outlier_df: pd.DataFrame,
-                         numeric_cols: list[str], title: str) -> str:
-    parts = [
-        f"# {title}",
-        f"Generated: {datetime.now().strftime('%d %B %Y, %H:%M')}",
-        "## Executive Summary",
-        *[f"- {line.replace('**', '')}" for line in summary_lines],
-        "## Data Quality",
-        quality_df.to_markdown(index=False) if not quality_df.empty else "Tidak tersedia.",
-    ]
-    if numeric_cols:
-        profile = numeric_profile(df, numeric_cols)
-        parts += ["## Numeric Profile", profile.round(2).to_markdown(index=False)]
-    if not outlier_df.empty:
-        parts += ["## Outlier Screening (IQR)", outlier_df.round(2).to_markdown(index=False)]
-    parts += [
-        "## Methodology & Limitations",
-        "- Analisis deskriptif menggambarkan data yang tersedia; bukan bukti sebab-akibat.",
-        "- Outlier menggunakan aturan 1.5 × IQR dan perlu ditinjau sesuai konteks bisnis.",
-        "- Korelasi Pearson mengukur hubungan linear dan tidak membuktikan kausalitas.",
-        "- Hasil dipengaruhi filter, missing values, definisi metrik, dan kualitas input.",
-    ]
-    return "\n\n".join(parts)
-
-
-def call_gemini(api_key: str, prompt: str, model: str = "gemini-2.5-flash") -> str:
-    """Optional API call. Imported only when user explicitly invokes the feature."""
-    import urllib.request
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 2200},
-    }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        result = json.loads(response.read().decode("utf-8"))
-    return result["candidates"][0]["content"]["parts"][0]["text"]
-
-
-# ---------------------------------------------------------------------------
-# Upload and parsing
-# ---------------------------------------------------------------------------
-uploaded_file = st.file_uploader(
-    "Unggah dataset CSV atau Excel",
+# ------------------------------ Upload --------------------------------------
+uploaded = st.file_uploader(
+    "① Upload dataset kamu",
     type=["csv", "xlsx", "xls"],
-    help="File diproses di sesi aplikasi. Untuk Excel, pilih sheet yang ingin dianalisis.",
+    help="Format CSV atau Excel. Data diproses di sesi aplikasi.",
+    key="main_dataset_uploader",
 )
 
-if uploaded_file is None:
-    st.info("Unggah file CSV atau Excel untuk memulai analisis.")
-    st.markdown(
-        """
-        **Modul yang tersedia**
-        - Data profiling, statistik deskriptif, dan audit kualitas data.
-        - Visualisasi distribusi, perbandingan kategori, tren waktu, dan hubungan metrik.
-        - Korelasi, screening outlier, serta segmentasi.
-        - Executive summary berbasis data dan laporan yang dapat diunduh.
-        """
-    )
+if uploaded is None:
+    st.markdown("### Mulai dalam 3 langkah")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown('<div class="step-card"><b>1. Upload data</b><br><small>Masukkan file CSV atau Excel.</small></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="step-card"><b>2. Pilih insight</b><br><small>Pilih pertanyaan bisnis yang ingin dijawab.</small></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown('<div class="step-card"><b>3. Download report</b><br><small>Hasilkan laporan visual siap dibagikan.</small></div>', unsafe_allow_html=True)
+    st.info("Belum ada dataset. Upload file untuk membuka menu analisis.")
     st.stop()
 
 try:
-    if uploaded_file.name.lower().endswith(".csv"):
-        try:
-            raw_df = pd.read_csv(uploaded_file)
-        except UnicodeDecodeError:
-            uploaded_file.seek(0)
-            raw_df = pd.read_csv(uploaded_file, encoding="latin-1")
-        sheet_name = None
+    if uploaded.name.lower().endswith(".csv"):
+        df_raw = read_upload(uploaded)
+        sheet = None
     else:
-        excel = pd.ExcelFile(uploaded_file)
-        sheet_name = st.sidebar.selectbox("Pilih sheet Excel", excel.sheet_names)
-        raw_df = pd.read_excel(excel, sheet_name=sheet_name)
+        xls = pd.ExcelFile(uploaded)
+        sheet = st.selectbox("Pilih sheet Excel", xls.sheet_names, key="excel_sheet_select")
+        df_raw = read_upload(uploaded, sheet)
 except Exception as exc:
-    st.error(f"File tidak dapat dibaca: {exc}")
+    st.error(f"File gagal dibaca: {exc}")
     st.stop()
 
-if raw_df.empty or len(raw_df.columns) == 0:
-    st.error("Dataset kosong atau tidak memiliki kolom.")
+if df_raw.empty:
+    st.error("Dataset kosong.")
     st.stop()
 
-# Remove completely empty rows/columns only after preserving original counts for transparency.
-empty_rows = int(raw_df.isna().all(axis=1).sum())
-empty_cols = int(raw_df.isna().all(axis=0).sum())
-raw_df = raw_df.dropna(how="all").dropna(axis=1, how="all")
-raw_df.columns = [str(c).strip() if str(c).strip() else f"Unnamed_{i+1}" for i, c in enumerate(raw_df.columns)]
-raw_df = raw_df.loc[:, ~pd.Index(raw_df.columns).duplicated()]
+df = df_raw.dropna(how="all").dropna(axis=1, how="all").copy()
+df.columns = [str(c).strip() or f"Kolom_{i+1}" for i, c in enumerate(df.columns)]
+df = df.loc[:, ~pd.Index(df.columns).duplicated()]
 
-numeric_cols, categorical_cols, date_cols = get_column_types(raw_df)
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+cat_cols = df.select_dtypes(include=["object", "category", "string", "bool"]).columns.tolist()
+date_cols = infer_dates(df)
 
-# ---------------------------------------------------------------------------
-# Sidebar controls and filters
-# ---------------------------------------------------------------------------
-st.sidebar.header("⚙️ Analysis Controls")
-st.sidebar.caption(f"File: {uploaded_file.name}")
-st.sidebar.caption(f"Data awal: {len(raw_df):,} rows × {len(raw_df.columns):,} columns")
+# ------------------------------ Snapshot ------------------------------------
+st.success(f"Dataset berhasil dibaca: {len(df):,} baris dan {len(df.columns):,} kolom.")
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Total records", f"{len(df):,}")
+k2.metric("Total variables", f"{len(df.columns):,}")
+k3.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
+k4.metric("Duplicate rows", f"{int(df.duplicated().sum()):,}")
 
-df = raw_df.copy()
-with st.sidebar.expander("Filter dataset", expanded=True):
-    filterable = categorical_cols.copy()
-    if filterable:
-        filter_col = st.selectbox("Filter berdasarkan kategori", ["Tidak ada"] + filterable)
-        if filter_col != "Tidak ada":
-            values = sorted(df[filter_col].dropna().astype(str).unique().tolist())
-            selected_values = st.multiselect(
-                f"Nilai {filter_col}",
-                values,
-                default=values,
-            )
-            df = df[df[filter_col].astype(str).isin(selected_values)]
-    else:
-        st.caption("Tidak ditemukan kolom kategori untuk filter.")
+st.divider()
+st.header("② Apa yang ingin kamu ketahui dari data ini?")
+st.caption("Pilih salah satu kebutuhan. Aplikasi akan menampilkan analisis yang relevan tanpa perlu mengatur grafik satu per satu.")
 
-    if date_cols:
-        date_filter_col = st.selectbox("Filter rentang tanggal (opsional)", ["Tidak ada"] + date_cols)
-        if date_filter_col != "Tidak ada":
-            date_values = coerce_date_column(df, date_filter_col)
-            valid_dates = date_values.dropna()
-            if len(valid_dates):
-                min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
-                selected_range = st.date_input(
-                    "Rentang tanggal",
-                    value=(min_date, max_date),
-                    min_value=min_date,
-                    max_value=max_date,
-                )
-                if isinstance(selected_range, tuple) and len(selected_range) == 2:
-                    start_date, end_date = selected_range
-                    df = df[
-                        (coerce_date_column(df, date_filter_col).dt.date >= start_date)
-                        & (coerce_date_column(df, date_filter_col).dt.date <= end_date)
-                    ]
+question_options = [
+    "Gambaran umum dataset",
+    "Profil audiens / pelanggan",
+    "Kategori atau segmen terbesar",
+    "Performa sebuah metrik",
+    "Tren berdasarkan waktu",
+    "Hubungan antarvariabel",
+    "Kualitas data dan anomali",
+    "Buat laporan eksekutif lengkap",
+]
+question = st.selectbox("Pilih jenis insight", question_options, key="insight_question")
 
-if df.empty:
-    st.warning("Tidak ada data yang sesuai dengan filter. Sesuaikan filter di sidebar.")
-    st.stop()
-
-numeric_cols, categorical_cols, date_cols = get_column_types(df)
-default_metric = numeric_cols[0] if numeric_cols else None
-selected_metric = st.sidebar.selectbox(
-    "Metrik utama untuk insight",
-    numeric_cols,
-    index=0 if numeric_cols else None,
-    help="Digunakan untuk ringkasan kategori dan beberapa rekomendasi otomatis.",
-) if numeric_cols else None
-
-# ---------------------------------------------------------------------------
-# Global KPIs
-# ---------------------------------------------------------------------------
-missing_cells = int(df.isna().sum().sum())
-missing_pct = missing_cells / max(df.size, 1) * 100
-duplicate_rows = int(df.duplicated().sum())
-
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Total Records", f"{len(df):,}", delta=f"{len(df)-len(raw_df):+,} vs data awal")
-k2.metric("Total Variables", f"{df.shape[1]:,}")
-k3.metric("Missing Cells", f"{missing_cells:,}", delta=pct(missing_pct), delta_color="inverse")
-k4.metric("Duplicate Rows", f"{duplicate_rows:,}")
-k5.metric("Numeric Metrics", f"{len(numeric_cols):,}")
-
-tabs = st.tabs([
-    "Overview & Data Quality",
-    "Visual Analytics",
-    "Correlation & Outliers",
-    "Segmentation",
-    "Executive Summary",
-])
-
-
-# ---------------------------------------------------------------------------
-# TAB 1: Overview and data quality
-# ---------------------------------------------------------------------------
-with tabs[0]:
-    st.subheader("Dataset Overview")
-    left, right = st.columns([1.2, 1])
-    with left:
-        st.markdown("**Data preview**")
-        st.dataframe(df.head(15), use_container_width=True, height=380)
-    with right:
-        st.markdown("**Column inventory**")
-        inventory = pd.DataFrame({
-            "Column": df.columns.astype(str),
-            "Data Type": [str(df[c].dtype) for c in df.columns],
-            "Role": [
-                "Numerik" if c in numeric_cols else "Tanggal" if c in date_cols else "Kategori / Teks"
-                for c in df.columns
-            ],
-        })
-        st.dataframe(inventory, use_container_width=True, height=380)
-
-    st.divider()
-    st.subheader("Data Quality Assessment")
-    quality = data_quality_report(df)
-    qa1, qa2, qa3 = st.columns(3)
-    qa1.metric("Rows completely empty removed", f"{empty_rows:,}")
-    qa2.metric("Columns completely empty removed", f"{empty_cols:,}")
-    qa3.metric("Duplicate rate", pct(duplicate_rows / max(len(df), 1) * 100))
-    st.dataframe(
-        quality.style.format({"Missing (%)": "{:.2f}%", "Unique (%)": "{:.2f}%"}),
-        use_container_width=True,
-        hide_index=True,
-    )
-    if missing_cells:
-        missing_plot = quality[quality["Missing"] > 0].sort_values("Missing", ascending=False)
-        fig_missing = px.bar(
-            missing_plot.head(20), x="Missing", y="Kolom", orientation="h",
-            title="Kolom dengan Missing Values Terbanyak",
-            text="Missing",
-        )
-        fig_missing.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_missing, use_container_width=True)
-
+# Keep controls and analysis in the same clear guided area.
+if question == "Gambaran umum dataset":
+    st.subheader("Gambaran umum")
+    st.dataframe(df.head(20), use_container_width=True)
+    st.markdown("**Komposisi tipe data**")
+    type_df = pd.DataFrame({
+        "Tipe": ["Numerik", "Kategori / teks", "Tanggal"],
+        "Jumlah kolom": [len(numeric_cols), len(cat_cols), len(date_cols)]
+    })
+    st.plotly_chart(px.bar(type_df, x="Tipe", y="Jumlah kolom", color="Tipe",
+                           title="Komposisi variabel"), use_container_width=True)
+    st.markdown("**Statistik numerik**")
     if numeric_cols:
-        st.divider()
-        st.subheader("Descriptive Statistics")
-        stats = numeric_profile(df, numeric_cols)
-        st.dataframe(
-            stats.style.format({
-                c: "{:,.2f}" for c in stats.select_dtypes(include="number").columns
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-    if categorical_cols:
-        st.divider()
-        st.subheader("Categorical Profile")
-        cat_rows = []
-        for col in categorical_cols:
-            mode = df[col].mode(dropna=True)
-            cat_rows.append({
-                "Kolom": col,
-                "Unique": df[col].nunique(dropna=True),
-                "Most Frequent": str(mode.iloc[0]) if len(mode) else "—",
-                "Frequency": int((df[col] == mode.iloc[0]).sum()) if len(mode) else 0,
-            })
-        st.dataframe(pd.DataFrame(cat_rows), use_container_width=True, hide_index=True)
-
-
-# ---------------------------------------------------------------------------
-# TAB 2: Visual analytics
-# ---------------------------------------------------------------------------
-with tabs[1]:
-    st.subheader("Visual Analytics")
-    chart_options = [
-        "Category Comparison",
-        "Metric Distribution",
-        "Metric Relationship",
-        "Time Trend",
-        "Top / Bottom Ranking",
-    ]
-    chart_type = st.selectbox("Pilih analisis visual", chart_options)
-
-    if chart_type == "Category Comparison":
-        if categorical_cols and numeric_cols:
-            c1, c2, c3 = st.columns(3)
-            x_col = c1.selectbox("Category", categorical_cols)
-            y_col = c2.selectbox("Metric", numeric_cols, index=numeric_cols.index(selected_metric) if selected_metric in numeric_cols else 0)
-            agg = c3.selectbox("Aggregation", ["Sum", "Mean", "Count"], key="visual_category_aggregation")
-            top_n = st.slider("Jumlah kategori yang ditampilkan", 5, 30, 15)
-            work = df[[x_col, y_col]].dropna(subset=[x_col])
-            if agg == "Sum":
-                grouped = work.groupby(x_col, as_index=False)[y_col].sum()
-                y_label = f"Total {y_col}"
-            elif agg == "Mean":
-                grouped = work.groupby(x_col, as_index=False)[y_col].mean()
-                y_label = f"Average {y_col}"
-            else:
-                grouped = work.groupby(x_col, as_index=False)[y_col].count()
-                y_label = "Record Count"
-            grouped = grouped.sort_values(y_col, ascending=False).head(top_n)
-            fig = px.bar(
-                grouped, x=x_col, y=y_col, color=y_col, text_auto=".3s",
-                title=f"{y_label} by {x_col}",
-                color_continuous_scale="Blues",
-            )
-            fig.update_layout(xaxis_title=x_col, yaxis_title=y_label, coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(grouped, use_container_width=True, hide_index=True)
-        else:
-            st.info("Visual perbandingan membutuhkan minimal satu kolom kategori dan satu kolom numerik.")
-
-    elif chart_type == "Metric Distribution":
-        if numeric_cols:
-            metric = st.selectbox("Pilih metrik", numeric_cols)
-            bins = st.slider("Jumlah bins", 5, 80, 30)
-            fig = px.histogram(
-                df, x=metric, nbins=bins, marginal="box",
-                title=f"Distribution & Spread — {metric}",
-                opacity=0.85,
-            )
-            fig.update_layout(yaxis_title="Frequency")
-            st.plotly_chart(fig, use_container_width=True)
-            s = df[metric].dropna()
-            if len(s):
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Mean", safe_number(s.mean()))
-                d2.metric("Median", safe_number(s.median()))
-                d3.metric("Std. Deviation", safe_number(s.std()))
-                d4.metric("Skewness", safe_number(s.skew()))
-        else:
-            st.info("Tidak ditemukan kolom numerik.")
-
-    elif chart_type == "Metric Relationship":
-        if len(numeric_cols) >= 2:
-            x_col = st.selectbox("X axis", numeric_cols, index=0)
-            y_col = st.selectbox("Y axis", numeric_cols, index=1)
-            color_col = st.selectbox("Color by (optional)", ["Tidak ada"] + categorical_cols)
-            size_col = st.selectbox("Bubble size (optional)", ["Tidak ada"] + numeric_cols)
-            plot_df = df[[x_col, y_col] + ([color_col] if color_col != "Tidak ada" else []) + ([size_col] if size_col != "Tidak ada" else [])].dropna(subset=[x_col, y_col])
-            fig = px.scatter(
-                plot_df, x=x_col, y=y_col,
-                color=None if color_col == "Tidak ada" else color_col,
-                size=None if size_col == "Tidak ada" else size_col,
-                trendline="ols" if len(plot_df) >= 3 else None,
-                opacity=0.7,
-                title=f"{x_col} vs {y_col}",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            if len(plot_df) >= 3:
-                corr = plot_df[[x_col, y_col]].corr().iloc[0, 1]
-                st.metric("Pearson correlation", f"{corr:.3f}")
-                st.caption("Korelasi menunjukkan asosiasi linear, bukan hubungan sebab-akibat.")
-        else:
-            st.info("Scatter plot membutuhkan minimal dua kolom numerik.")
-
-    elif chart_type == "Time Trend":
-        if date_cols and numeric_cols:
-            date_col = st.selectbox("Date column", date_cols)
-            metric = st.selectbox("Metric", numeric_cols)
-            frequency_label = st.selectbox("Time aggregation", ["Daily", "Weekly", "Monthly", "Quarterly", "Yearly"])
-            frequency_map = {"Daily": "D", "Weekly": "W", "Monthly": "MS", "Quarterly": "QS", "Yearly": "YS"}
-            trend = pd.DataFrame({
-                "date": coerce_date_column(df, date_col),
-                "value": pd.to_numeric(df[metric], errors="coerce"),
-            }).dropna()
-            if not trend.empty:
-                trend = trend.set_index("date").resample(frequency_map[frequency_label])["value"].agg(["sum", "mean", "count"]).reset_index()
-                measure = st.radio("Metric calculation", ["sum", "mean", "count"], horizontal=True)
-                fig = px.line(trend, x="date", y=measure, markers=True, title=f"{metric} — {frequency_label} trend ({measure})")
-                st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(trend, use_container_width=True, hide_index=True)
-        else:
-            st.info("Time trend membutuhkan kolom tanggal dan numerik.")
-
-    elif chart_type == "Top / Bottom Ranking":
-        if categorical_cols and numeric_cols:
-            cat = st.selectbox("Category", categorical_cols)
-            metric = st.selectbox("Metric", numeric_cols)
-            direction = st.radio("Ranking", ["Top", "Bottom"], horizontal=True)
-            n = st.slider("Number of categories", 5, 30, 10)
-            ranking = df.groupby(cat, dropna=False)[metric].sum().sort_values(ascending=(direction == "Bottom")).head(n).reset_index()
-            fig = px.bar(ranking, x=metric, y=cat, orientation="h", text_auto=".3s", title=f"{direction} {n}: {metric} by {cat}")
-            fig.update_layout(yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(ranking, use_container_width=True, hide_index=True)
-        else:
-            st.info("Ranking membutuhkan kolom kategori dan numerik.")
-
-
-# ---------------------------------------------------------------------------
-# TAB 3: Correlation and outliers
-# ---------------------------------------------------------------------------
-with tabs[2]:
-    st.subheader("Correlation Analysis")
-    if len(numeric_cols) >= 2:
-        method = st.radio("Correlation method", ["Pearson", "Spearman", "Kendall"], horizontal=True)
-        corr_matrix = df[numeric_cols].corr(method=method.lower())
-        fig_corr = px.imshow(
-            corr_matrix, text_auto=".2f", aspect="auto",
-            color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
-            title=f"{method} Correlation Matrix",
-        )
-        st.plotly_chart(fig_corr, use_container_width=True)
-
-        pairs = []
-        cols = corr_matrix.columns.tolist()
-        for i in range(len(cols)):
-            for j in range(i + 1, len(cols)):
-                value = corr_matrix.iloc[i, j]
-                if pd.notna(value):
-                    pairs.append((cols[i], cols[j], value))
-        pairs.sort(key=lambda x: abs(x[2]), reverse=True)
-        if pairs:
-            st.markdown("**Strongest variable relationships**")
-            st.dataframe(
-                pd.DataFrame(pairs[:10], columns=["Variable 1", "Variable 2", "Correlation"])
-                .assign(Strength=lambda x: x["Correlation"].abs())
-                .sort_values("Strength", ascending=False)
-                .drop(columns="Strength")
-                .style.format({"Correlation": "{:.3f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-        st.caption("Korelasi tidak membuktikan kausalitas. Periksa ukuran sampel, outlier, dan kemungkinan variabel perancu.")
+        st.dataframe(df[numeric_cols].describe().T.round(2), use_container_width=True)
     else:
-        st.info("Korelasi membutuhkan minimal dua kolom numerik.")
+        st.info("Tidak ditemukan kolom numerik.")
 
-    st.divider()
-    st.subheader("Outlier Screening — IQR Method")
-    if numeric_cols:
-        outlier_df = calculate_outliers(df, numeric_cols)
-        if not outlier_df.empty:
-            st.dataframe(
-                outlier_df.style.format({
-                    "Q1": "{:,.2f}", "Median": "{:,.2f}", "Q3": "{:,.2f}",
-                    "Batas Bawah IQR": "{:,.2f}", "Batas Atas IQR": "{:,.2f}",
-                    "Outlier (%)": "{:.2f}%",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
-            selected_outlier_metric = st.selectbox("Inspect outlier distribution", numeric_cols)
-            s = df[selected_outlier_metric].dropna()
-            if len(s):
-                q1, q3 = s.quantile([0.25, 0.75])
-                iqr = q3 - q1
-                low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-                flagged = df[(df[selected_outlier_metric] < low) | (df[selected_outlier_metric] > high)]
-                st.metric("Flagged records", f"{len(flagged):,}", delta=pct(len(flagged) / max(len(s), 1) * 100))
-                st.dataframe(flagged.head(100), use_container_width=True)
-                if len(flagged) > 100:
-                    st.caption("Preview dibatasi 100 baris; gunakan data hasil filter untuk mempersempit inspeksi.")
-        else:
-            st.info("Tidak ada nilai numerik valid untuk dihitung.")
+elif question == "Profil audiens / pelanggan":
+    st.subheader("Profil audiens / pelanggan")
+    st.caption("Pilih dimensi seperti usia, gender, pekerjaan, domisili, preferensi, atau kanal informasi.")
+    if not cat_cols:
+        st.warning("Tidak ada kolom kategori yang dapat dianalisis.")
     else:
-        st.info("Outlier screening membutuhkan kolom numerik.")
-
-
-# ---------------------------------------------------------------------------
-# TAB 4: Segmentation
-# ---------------------------------------------------------------------------
-with tabs[3]:
-    st.subheader("Segment & Contribution Analysis")
-    if categorical_cols and numeric_cols:
-        c1, c2, c3 = st.columns(3)
-        segment_col = c1.selectbox("Segment dimension", categorical_cols)
-        metric_col = c2.selectbox("Performance metric", numeric_cols)
-        segment_agg = c3.selectbox("Aggregation", ["Sum", "Mean", "Count"], key="segment_aggregation")
-        segment_data = df[[segment_col, metric_col]].dropna(subset=[segment_col])
-        if segment_agg == "Sum":
-            seg = segment_data.groupby(segment_col)[metric_col].sum().rename("Value")
-        elif segment_agg == "Mean":
-            seg = segment_data.groupby(segment_col)[metric_col].mean().rename("Value")
-        else:
-            seg = segment_data.groupby(segment_col)[metric_col].count().rename("Value")
-        seg = seg.sort_values(ascending=False).reset_index()
-        total_value = seg["Value"].sum()
-        seg["Contribution (%)"] = seg["Value"] / total_value * 100 if total_value else 0
-        seg["Cumulative (%)"] = seg["Contribution (%)"].cumsum()
-
-        top_n = st.slider("Segments to display", 5, 30, 10, key="segment_topn")
-        display_seg = seg.head(top_n)
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=display_seg[segment_col].astype(str), y=display_seg["Value"], name="Value"))
-        fig.add_trace(go.Scatter(
-            x=display_seg[segment_col].astype(str),
-            y=display_seg["Cumulative (%)"],
-            name="Cumulative contribution (%)",
-            yaxis="y2",
-            mode="lines+markers",
-        ))
-        fig.update_layout(
-            title=f"Segment contribution: {metric_col} by {segment_col}",
-            yaxis=dict(title="Value"),
-            yaxis2=dict(title="Cumulative contribution (%)", overlaying="y", side="right", range=[0, 105]),
-            legend=dict(orientation="h"),
+        selected_profile_cols = st.multiselect(
+            "Dimensi profil yang ingin ditampilkan",
+            cat_cols,
+            default=cat_cols[:min(6, len(cat_cols))],
+            max_selections=9,
+            key="audience_profile_dimensions",
         )
+        if selected_profile_cols:
+            cols = st.columns(3)
+            for i, col in enumerate(selected_profile_cols):
+                with cols[i % 3]:
+                    st.markdown(f"**{col}**")
+                    summary = category_summary(df, col, 8)
+                    fig = px.bar(summary.sort_values("Jumlah"), x="Jumlah", y="Kategori",
+                                 orientation="h", text=summary.sort_values("Jumlah")["Persentase"].map(lambda x: f"{x:.1f}%"),
+                                 title=None)
+                    fig.update_layout(height=260, margin=dict(l=5,r=5,t=5,b=5),
+                                      showlegend=False, yaxis_title=None, xaxis_title="Jumlah")
+                    st.plotly_chart(fig, use_container_width=True, key=f"audience_chart_{i}")
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+elif question == "Kategori atau segmen terbesar":
+    st.subheader("Analisis kategori / segmen")
+    if not cat_cols:
+        st.warning("Tidak ada kolom kategori.")
+    else:
+        chosen_cat = st.selectbox("Kategori yang ingin dibandingkan", cat_cols, key="segment_category_select")
+        top_n = st.slider("Jumlah kategori", 3, 20, min(10, max(3, df[chosen_cat].nunique())), key="segment_topn_select")
+        summary = category_summary(df, chosen_cat, top_n)
+        fig = px.bar(summary.sort_values("Jumlah"), x="Jumlah", y="Kategori", orientation="h",
+                     text=summary.sort_values("Jumlah")["Persentase"].map(lambda x: f"{x:.1f}%"),
+                     title=f"Distribusi {chosen_cat}")
         st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(seg, use_container_width=True, hide_index=True)
-        if len(seg):
-            st.info(
-                f"Segmen terbesar adalah **{seg.iloc[0][segment_col]}** dengan nilai "
-                f"**{safe_number(seg.iloc[0]['Value'])}** dan kontribusi "
-                f"**{seg.iloc[0]['Contribution (%)']:.1f}%**."
-            )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+elif question == "Performa sebuah metrik":
+    st.subheader("Analisis metrik")
+    if not numeric_cols:
+        st.warning("Tidak ada kolom numerik.")
     else:
-        st.info("Segment analysis membutuhkan minimal satu kolom kategori dan satu kolom numerik.")
+        metric = st.selectbox("Pilih metrik", numeric_cols, key="metric_performance_select")
+        stats = numeric_summary(df, metric)
+        s = pd.to_numeric(df[metric], errors="coerce").dropna()
+        a,b,c,d = st.columns(4)
+        a.metric("Total", fmt_num(stats["sum"]))
+        b.metric("Average", fmt_num(stats["mean"]))
+        c.metric("Median", fmt_num(stats["median"]))
+        d.metric("Valid values", f"{stats['count']:,}")
+        fig = px.histogram(df, x=metric, marginal="box", title=f"Distribusi {metric}")
+        st.plotly_chart(fig, use_container_width=True)
+        if cat_cols:
+            split = st.selectbox("Bandingkan berdasarkan kategori (opsional)", ["Tidak ada"] + cat_cols, key="metric_split_select")
+            if split != "Tidak ada":
+                agg = df.groupby(split, dropna=False)[metric].agg(["sum","mean","count"]).reset_index()
+                st.plotly_chart(px.bar(agg.sort_values("sum", ascending=False).head(15),
+                                       x=split, y="sum", title=f"Total {metric} per {split}"),
+                                use_container_width=True)
 
-
-# ---------------------------------------------------------------------------
-# TAB 5: Executive summary and exports
-# ---------------------------------------------------------------------------
-with tabs[4]:
-    st.subheader("Executive Summary")
-    st.caption("Ringkasan otomatis berbasis statistik dataset. Validasi konteks bisnis sebelum mengambil keputusan.")
-
-    summary_lines = build_rule_based_summary(
-        df, raw_df, numeric_cols, categorical_cols, date_cols, selected_metric
-    )
-    for idx, line in enumerate(summary_lines, start=1):
-        st.markdown(f"<div class='insight-card'><b>{idx:02d}.</b> {line}</div>", unsafe_allow_html=True)
-
-    st.divider()
-    st.subheader("Key Findings & Management Considerations")
-    considerations = []
-    if missing_pct >= 10:
-        considerations.append(f"Missing value mencapai {missing_pct:.1f}%; periksa apakah pola missing terkonsentrasi pada kolom atau periode tertentu sebelum analisis lanjutan.")
-    elif missing_cells:
-        considerations.append(f"Terdapat {missing_cells:,} missing cells; evaluasi dampaknya pada metrik yang digunakan.")
+elif question == "Tren berdasarkan waktu":
+    st.subheader("Analisis tren waktu")
+    if not date_cols or not numeric_cols:
+        st.warning("Dibutuhkan setidaknya satu kolom tanggal dan satu kolom numerik.")
     else:
-        considerations.append("Tidak ditemukan missing cells pada data hasil filter.")
-    if duplicate_rows:
-        considerations.append(f"Ada {duplicate_rows:,} baris duplikat. Pastikan apakah ini duplikasi transaksi/record atau observasi yang memang sah.")
+        date_col = st.selectbox("Kolom tanggal", date_cols, key="trend_date_select")
+        metric = st.selectbox("Metrik", numeric_cols, key="trend_metric_select")
+        freq_label = st.selectbox("Periode", ["Harian","Mingguan","Bulanan","Kuartalan","Tahunan"], key="trend_freq_select")
+        freq = {"Harian":"D","Mingguan":"W","Bulanan":"MS","Kuartalan":"QS","Tahunan":"YS"}[freq_label]
+        calc = st.radio("Perhitungan", ["Total","Rata-rata","Jumlah record"], horizontal=True, key="trend_calc_select")
+        tmp = pd.DataFrame({"tanggal":pd.to_datetime(df[date_col], errors="coerce", dayfirst=True),
+                            "nilai":pd.to_numeric(df[metric], errors="coerce")}).dropna()
+        if not tmp.empty:
+            resample_agg = {"Total":"sum","Rata-rata":"mean","Jumlah record":"count"}[calc]
+            trend = tmp.set_index("tanggal").resample(freq)["nilai"].agg(resample_agg).reset_index()
+            st.plotly_chart(px.line(trend, x="tanggal", y="nilai", markers=True,
+                                    title=f"{calc} {metric} — {freq_label}"), use_container_width=True)
+            st.dataframe(trend, use_container_width=True, hide_index=True)
+
+elif question == "Hubungan antarvariabel":
+    st.subheader("Hubungan antarvariabel")
+    if len(numeric_cols) < 2:
+        st.warning("Dibutuhkan minimal dua kolom numerik.")
     else:
-        considerations.append("Tidak ditemukan baris duplikat identik.")
+        x = st.selectbox("Variabel X", numeric_cols, key="relationship_x_select")
+        y = st.selectbox("Variabel Y", [c for c in numeric_cols if c != x], key="relationship_y_select")
+        method = st.radio("Metode korelasi", ["Pearson","Spearman","Kendall"], horizontal=True, key="relationship_corr_method")
+        corr = df[[x,y]].corr(method=method.lower()).iloc[0,1]
+        st.metric(f"Korelasi {method}", f"{corr:.3f}" if pd.notna(corr) else "Tidak tersedia")
+        fig = px.scatter(df, x=x, y=y, trendline="ols" if df[[x,y]].dropna().shape[0] >= 3 else None,
+                         title=f"{x} vs {y}", opacity=.7)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Korelasi menunjukkan asosiasi, bukan hubungan sebab-akibat.")
+
+elif question == "Kualitas data dan anomali":
+    st.subheader("Audit kualitas data")
+    quality = quality_profile(df)
+    st.dataframe(quality, use_container_width=True, hide_index=True)
+    missing = quality[quality["Kosong"] > 0].sort_values("Kosong", ascending=False)
+    if not missing.empty:
+        st.plotly_chart(px.bar(missing, x="Kosong", y="Kolom", orientation="h",
+                               title="Missing values per kolom"), use_container_width=True)
     if numeric_cols:
-        outlier_summary = calculate_outliers(df, numeric_cols)
-        if not outlier_summary.empty:
-            most_outlier = outlier_summary.sort_values("Outlier (%)", ascending=False).iloc[0]
-            considerations.append(
-                f"Proporsi outlier IQR tertinggi terdapat pada **{most_outlier['Metrik']}** "
-                f"({most_outlier['Outlier']:,} nilai; {most_outlier['Outlier (%)']:.1f}%). "
-                "Flag ini perlu ditinjau, bukan otomatis dihapus."
-            )
-    for item in considerations:
-        st.markdown(f"- {item}")
+        rows = []
+        for col in numeric_cols:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(s):
+                q1, q3 = s.quantile([.25,.75]); iqr=q3-q1
+                count=int(((s < q1-1.5*iqr) | (s > q3+1.5*iqr)).sum())
+                rows.append({"Metrik":col,"Outlier IQR":count,"Outlier (%)":count/max(len(s),1)*100})
+        st.markdown("**Screening outlier (IQR)**")
+        st.dataframe(pd.DataFrame(rows).round(2), use_container_width=True, hide_index=True)
+    st.caption("Outlier adalah penanda untuk diperiksa, bukan otomatis kesalahan atau data yang harus dihapus.")
 
-    st.markdown("**Recommended management workflow**")
-    st.markdown(
-        "1. **Validate:** konfirmasi definisi KPI, satuan, periode, dan kelengkapan sumber data.  \n"
-        "2. **Diagnose:** telusuri segmen, periode, atau variabel yang paling berkontribusi terhadap perubahan.  \n"
-        "3. **Prioritize:** pilih 1–3 temuan dengan dampak bisnis terbesar dan tingkat keyakinan data memadai.  \n"
-        "4. **Act & monitor:** tetapkan owner, target, tenggat, dan metrik pemantauan untuk setiap tindakan."
-    )
+# ------------------------------ Report builder -----------------------------
+st.divider()
+st.header("③ Buat laporan dan download")
+st.caption("Laporan visual mengikuti gaya Audience Overview Manado: latar navy gelap, aksen cyan, kartu KPI, distribusi kategori, dan executive signals.")
 
-    st.divider()
-    st.subheader("AI-assisted Strategic Narrative (Optional)")
-    st.warning(
-        "Jika fitur AI digunakan, hanya ringkasan statistik, profil kolom, dan sampel terbatas "
-        "yang dikirim ke Google Gemini. Jangan gunakan dataset berisi data pribadi, rahasia, "
-        "atau informasi sensitif tanpa otorisasi dan kebijakan yang sesuai."
-    )
-    with st.expander("Generate AI narrative"):
-        api_key = st.text_input("Gemini API key", type="password", key="gemini_key")
-        ai_model = st.selectbox("Model", ["gemini-2.5-flash"], index=0)
-        if st.button("Generate strategic executive summary", type="primary"):
-            if not api_key.strip():
-                st.error("Masukkan Gemini API key terlebih dahulu.")
-            else:
-                # Send aggregated profile only; do not transmit the full raw dataset.
-                profile = {
-                    "dataset_shape": {"rows": int(len(df)), "columns": int(df.shape[1])},
-                    "quality": {
-                        "missing_cells": missing_cells,
-                        "missing_percent": round(missing_pct, 2),
-                        "duplicate_rows": duplicate_rows,
-                    },
-                    "numeric_summary": numeric_profile(df, numeric_cols).replace({np.nan: None}).to_dict(orient="records")[:30],
-                    "categorical_summary": [
-                        {
-                            "column": col,
-                            "unique": int(df[col].nunique(dropna=True)),
-                            "top_values": df[col].value_counts(dropna=True).head(5).to_dict(),
-                        }
-                        for col in categorical_cols[:15]
-                    ],
-                    "date_ranges": {
-                        col: {
-                            "min": str(coerce_date_column(df, col).min()),
-                            "max": str(coerce_date_column(df, col).max()),
-                        }
-                        for col in date_cols[:5]
-                    },
-                    "rule_based_findings": [re.sub(r"\*\*", "", x) for x in summary_lines],
-                }
-                prompt = f"""
-Anda adalah konsultan strategi dan Chief Data Officer. Susun executive report
-dalam Bahasa Indonesia yang lugas, berbasis bukti, dan ditujukan kepada direksi.
-
-Gunakan hanya data yang tersedia di bawah. Jangan mengarang target, penyebab,
-benchmark industri, atau angka. Bedakan fakta, interpretasi, hipotesis, dan
-rekomendasi. Jika data tidak cukup, nyatakan keterbatasannya.
-
-Struktur wajib:
-1. Executive Brief (3-5 kalimat: kondisi utama, temuan paling penting, implikasi)
-2. Business Performance & Key Findings (angka, kontribusi, tren/pola yang didukung)
-3. Data Quality & Analytical Caveats
-4. Risks / Opportunities (prioritaskan berdasarkan urgensi dan potensi dampak; tandai hipotesis)
-5. Strategic Recommendations (3-5 tindakan konkret; untuk setiap tindakan sertakan rationale,
-   prioritas High/Medium/Low, KPI pemantauan, dan data tambahan yang dibutuhkan)
-6. Decisions Required from Management (keputusan yang perlu diambil; tulis 'Belum dapat ditentukan'
-   jika data tidak mendukung)
-
-Hindari klaim kausalitas dari korelasi. Jangan menyebut temuan sebagai tren jika tidak ada
-dimensi waktu. Jangan membuat rekomendasi yang tidak berhubungan dengan temuan.
-
-DATA PROFILE:
-{json.dumps(profile, ensure_ascii=False, default=str)}
-"""
-                with st.spinner("Menyusun analisis strategis..."):
-                    try:
-                        ai_text = call_gemini(api_key.strip(), prompt, ai_model)
-                        st.session_state["ai_executive_summary"] = ai_text
-                    except Exception as exc:
-                        st.error(f"Gagal menghasilkan analisis AI: {exc}")
-
-        if st.session_state.get("ai_executive_summary"):
-            st.markdown(st.session_state["ai_executive_summary"])
-
-    # Report artifacts
-    quality = data_quality_report(df)
-    outlier_report = calculate_outliers(df, numeric_cols)
-    report_md = make_markdown_report(
-        df, summary_lines, quality, outlier_report, numeric_cols,
-        title=f"Executive Data Report — {uploaded_file.name}",
-    )
-    ai_saved = st.session_state.get("ai_executive_summary")
-    if ai_saved:
-        report_md += "\n\n## AI-assisted Strategic Narrative\n\n" + ai_saved
-
-    st.divider()
-    st.subheader("Export & Download")
-    exp1, exp2, exp3 = st.columns(3)
-    with exp1:
-        st.download_button(
-            "Download Executive Report (.md)",
-            data=report_md.encode("utf-8"),
-            file_name="executive_data_report.md",
-            mime="text/markdown",
-            use_container_width=True,
+with st.container(border=True):
+    report_title = st.text_input("Judul laporan", value="AUDIENCE OVERVIEW — DATA SNAPSHOT", key="report_title_input")
+    r1, r2 = st.columns(2)
+    with r1:
+        report_categories = st.multiselect(
+            "Dimensi kategori untuk laporan (maksimal 6)",
+            cat_cols,
+            default=cat_cols[:min(6,len(cat_cols))],
+            max_selections=6,
+            key="report_category_fields",
+            help="Contoh: gender, usia, pekerjaan, domisili, kanal promosi, preferensi brand."
         )
-    with exp2:
-        csv_buffer = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "Download Filtered Data (.csv)",
-            data=csv_buffer,
-            file_name="filtered_dataset.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with exp3:
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Filtered Data")
-            quality.to_excel(writer, index=False, sheet_name="Data Quality")
-            if not outlier_report.empty:
-                outlier_report.to_excel(writer, index=False, sheet_name="Outlier Analysis")
-            if numeric_cols:
-                numeric_profile(df, numeric_cols).to_excel(writer, index=False, sheet_name="Numeric Profile")
-        st.download_button(
-            "Download Analysis Workbook (.xlsx)",
-            data=excel_buffer.getvalue(),
-            file_name="executive_data_analysis.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+    with r2:
+        report_metric = st.selectbox(
+            "Metrik numerik utama (opsional)",
+            ["Tidak ada"] + numeric_cols,
+            key="report_primary_metric",
         )
 
-st.caption(
-    "Analytical note: aplikasi ini membantu eksplorasi dan penyusunan hipotesis. "
-    "Validasi definisi metrik, kualitas sumber, dan konteks operasional tetap diperlukan."
-)
+    if st.button("Generate Executive Overview PDF", type="primary", use_container_width=True, key="generate_pdf_report"):
+        try:
+            metric_arg = None if report_metric == "Tidak ada" else report_metric
+            pdf_bytes = build_pdf(df, report_title.strip() or "EXECUTIVE DATA OVERVIEW",
+                                  report_categories, metric_arg)
+            st.session_state["generated_pdf"] = pdf_bytes
+            st.session_state["generated_pdf_name"] = "executive_data_overview.pdf"
+            st.success("Laporan PDF berhasil dibuat.")
+        except Exception as exc:
+            st.error(f"Gagal membuat PDF: {exc}")
+
+    if st.session_state.get("generated_pdf"):
+        st.download_button(
+            "⬇️ Download Executive Overview (PDF)",
+            data=st.session_state["generated_pdf"],
+            file_name=st.session_state.get("generated_pdf_name","executive_data_overview.pdf"),
+            mime="application/pdf",
+            use_container_width=True,
+            key="download_generated_pdf",
+        )
+
+# Other useful exports
+with st.expander("Download data dan tabel analisis"):
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Download filtered dataset (CSV)", csv_bytes,
+                       "analyzed_dataset.csv", "text/csv", key="download_dataset_csv")
+    xbuf = io.BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data")
+        quality_profile(df).to_excel(writer, index=False, sheet_name="Data Quality")
+        if numeric_cols:
+            df[numeric_cols].describe().T.to_excel(writer, sheet_name="Numeric Summary")
+    st.download_button("Download analysis workbook (Excel)", xbuf.getvalue(),
+                       "analysis_workbook.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key="download_analysis_xlsx")
+
+st.caption("Catatan: analisis bersifat deskriptif. Pastikan definisi variabel, kualitas sampel, dan konteks bisnis tervalidasi sebelum mengambil keputusan.")
