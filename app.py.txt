@@ -1,0 +1,57 @@
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+
+# Konfigurasi halaman agar ramah mobile
+st.set_page_config(page_title="Executive Data Assistant", layout="centered")
+
+st.title("📊 Executive Data Analyzer")
+st.markdown("Unggah data Anda untuk mendapatkan analisis instan dan ringkasan eksekutif.")
+
+# 1. Modul Membaca Data
+uploaded_file = st.file_uploader("Pilih file CSV atau Excel", type=["csv", "xlsx"])
+
+if uploaded_file is not None:
+    # Membaca data berdasarkan ekstensi file
+    if uploaded_file.name.endswith('.csv'):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+    
+    st.subheader("📋 Pratinjau Data")
+    st.dataframe(df.head(5), use_container_width=True)
+    
+    # 2. Modul Analisa Data Dasar
+    st.subheader("📈 Analisa Statistik & Metrik Utama")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Total Baris Data", df.shape[0])
+    with col2:
+        st.metric("Total Kolom", df.shape[1])
+    with col3:
+        # Contoh mendeteksi kolom numerik pertama untuk ringkasan
+        num_cols = df.select_dtypes(include=['number']).columns
+        if len(num_cols) > 0:
+            st.metric(f"Rata-rata {num_cols[0]}", round(df[num_cols[0]].mean(), 2))
+
+    # Visualisasi Sederhana yang ramah mobile
+    if len(num_cols) >= 2:
+        st.subheader("📊 Visualisasi Cepat")
+        fig = px.scatter(df, x=num_cols[0], y=num_cols[1], title=f"Korelasi {num_cols[0]} vs {num_cols[1]}")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 3. Modul Executive Summary & Penjelasan (Simulasi Integrasi AI)
+    st.subheader("📝 Executive Summary & Insights")
+    if st.button("Generate Executive Summary"):
+        with st.spinner("Menganalisis pola data dan menyusun ringkasan..."):
+            # Di bagian ini, ringkasan statistik (df.describe().to_string()) 
+            # dapat dikirimkan ke LLM API untuk menghasilkan narasi strategis.
+            
+            summary_placeholder = """
+            ### 📌 Poin Utama Eksekutif:
+            * **Pertumbuhan Stabil:** Berdasarkan data yang diunggah, tren utama menunjukkan kestabilan pada parameter utama.
+            * **Faktor Anomali:** Ditemukan beberapa lonjakan data pada kategori tertentu yang memerlukan perhatian khusus tim operasional.
+            * **Rekomendasi Strategis:** Disarankan untuk memfokuskan alokasi sumber daya pada metrik dengan performa tertinggi guna memaksimalkan *return*.
+            """
+            st.markdown(summary_placeholder)
