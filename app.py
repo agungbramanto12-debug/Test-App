@@ -689,7 +689,7 @@ with tabs[3]:
         c1, c2, c3 = st.columns(3)
         segment_col = c1.selectbox("Segment dimension", categorical_cols)
         metric_col = c2.selectbox("Performance metric", numeric_cols)
-        segment_agg = c3.selectbox("Aggregation", ["Sum", "Mean", "Count"], key="visual_category_aggregation")
+        segment_agg = c3.selectbox("Aggregation", ["Sum", "Mean", "Count"], key="segment_aggregation")
         segment_data = df[[segment_col, metric_col]].dropna(subset=[segment_col])
         if segment_agg == "Sum":
             seg = segment_data.groupby(segment_col)[metric_col].sum().rename("Value")
