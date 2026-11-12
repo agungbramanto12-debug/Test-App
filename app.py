@@ -108,6 +108,77 @@ def quality_profile(frame: pd.DataFrame):
         })
     return pd.DataFrame(rows)
 
+
+
+def detect_business_context(frame: pd.DataFrame):
+    """Heuristic dataset classification; labels are suggestions, not guaranteed semantics."""
+    names = [str(c).lower().replace("_", " ").replace("-", " ") for c in frame.columns]
+    blob = " ".join(names)
+    profiles = {
+        "Audience & Survey": ["respondent", "responden", "gender", "jenis kelamin", "age", "usia", "umur", "occupation", "pekerjaan", "domicile", "domisili", "satisfaction", "kepuasan", "survey", "survei", "preference", "preferensi"],
+        "Marketing & Digital Performance": ["reach", "impression", "engagement", "click", "ctr", "cpc", "cpm", "conversion", "campaign", "campaign", "social", "platform", "followers", "views", "profile visit"],
+        "Sales & Revenue": ["revenue", "sales", "penjualan", " omzet", "transaction", "transaksi", "order", "quantity", "qty", "unit sold", "harga", "price", "product", "produk", "customer"],
+        "Event Performance": ["attendee", "attendance", "visitor", "pengunjung", "ticket", "tiket", "event", "activation", "aktivasi", "venue", "gate", "registration", "registrasi"],
+        "Finance & Budget": ["budget", "anggaran", "actual", "realisasi", "expense", "expenditure", "cost", "biaya", "spend", "variance", "margin", "profit", "laba", "cashflow"],
+        "Operations & Productivity": ["duration", "durasi", "cycle time", "productivity", "produktivitas", "output", "downtime", "defect", "error", "sla", "completion", "completed", "status", "inventory", "stock"]
+    }
+    scores = {k: sum(1 for token in tokens if token in blob) for k, tokens in profiles.items()}
+    best = max(scores, key=scores.get)
+    if scores[best] == 0:
+        best = "General Business Dataset"
+    confidence = scores[best] / max(sum(scores.values()), 1)
+    return best, confidence, scores
+
+
+def infer_metric_roles(frame: pd.DataFrame, numeric_cols: list[str]):
+    """Map likely business KPI roles from column names, preserving the original columns."""
+    roles = {
+        "Revenue / Value": ["revenue", "sales", "gmv", "amount", "value", "nilai", "nominal", "total", "price", "harga", "cost", "biaya", "budget", "actual", "spend", "expense", "profit", "margin"],
+        "Volume / Count": ["count", "jumlah", "qty", "quantity", "unit", "volume", "visitor", "attendee", "ticket", "order", "transaction", "record", "respondent", "responden", "impression", "view", "click", "reach", "follower"],
+        "Rate / Percentage": ["rate", "ratio", "percent", "percentage", "persen", "conversion", "ctr", "engagement rate", "growth", "retention", "share", "margin"],
+        "Duration / Time": ["duration", "durasi", "time", "waktu", "latency", "hour", "minute", "second", "menit", "detik"]
+    }
+    mapped = {role: [] for role in roles}
+    for col in numeric_cols:
+        low = str(col).lower().replace("_", " ").replace("-", " ")
+        matches = [role for role, tokens in roles.items() if any(t in low for t in tokens)]
+        for role in matches:
+            mapped[role].append(col)
+    return mapped
+
+
+def build_auto_insights(frame: pd.DataFrame, numeric_cols: list[str], cat_cols: list[str], date_cols: list[str]):
+    findings = []
+    n, p = len(frame), len(frame.columns)
+    missing = int(frame.isna().sum().sum())
+    duplicates = int(frame.duplicated().sum())
+    findings.append(("Dataset scale", f"Dataset berisi {n:,} records dan {p:,} variables.", "info"))
+    if missing:
+        top_missing = frame.isna().mean().sort_values(ascending=False)
+        col = str(top_missing.index[0])
+        findings.append(("Data completeness", f"Terdapat {missing:,} missing cells. Kolom dengan missing rate tertinggi adalah {col} ({top_missing.iloc[0]*100:.1f}%).", "warning"))
+    else:
+        findings.append(("Data completeness", "Tidak ditemukan missing values pada dataset ini.", "success"))
+    if duplicates:
+        findings.append(("Duplicate records", f"Ditemukan {duplicates:,} baris duplikat identik ({duplicates/max(n,1)*100:.1f}% dari records). Validasi sebelum menghapusnya.", "warning"))
+    if cat_cols:
+        for col in cat_cols[:4]:
+            summ = category_summary(frame, col, 1)
+            if not summ.empty:
+                r = summ.iloc[0]
+                findings.append((f"Largest segment · {col}", f"Kategori terbesar adalah '{r['Kategori']}' dengan {int(r['Jumlah']):,} records ({r['Persentase']:.1f}% dari nilai terisi).", "insight"))
+    for col in numeric_cols[:4]:
+        s = pd.to_numeric(frame[col], errors="coerce").dropna()
+        if len(s):
+            findings.append((f"Metric · {col}", f"Rata-rata {fmt_num(s.mean())}; median {fmt_num(s.median())}; rentang {fmt_num(s.min())} hingga {fmt_num(s.max())}.", "insight"))
+    if date_cols:
+        col = date_cols[0]
+        dates = pd.to_datetime(frame[col], errors="coerce", dayfirst=True).dropna()
+        if len(dates):
+            findings.append(("Time coverage", f"Rentang tanggal terdeteksi: {dates.min().strftime('%d %b %Y')} sampai {dates.max().strftime('%d %b %Y')}.", "info"))
+    return findings
+
+
 def build_pdf(frame, report_title, selected_categories, primary_metric):
     """Build a compact, dark editorial dashboard PDF using ReportLab Platypus."""
     from reportlab.lib import colors
@@ -199,7 +270,7 @@ def build_pdf(frame, report_title, selected_categories, primary_metric):
     missing = int(frame.isna().sum().sum())
     dup = int(frame.duplicated().sum())
     kpis = [
-        ("TOTAL RESPONDEN / RECORDS", f"{len(frame):,}", "Basis data yang dianalisis"),
+        ("TOTAL RECORDS", f"{len(frame):,}", "Basis data yang dianalisis"),
         ("TOTAL VARIABLES", f"{len(frame.columns):,}", "Kolom dalam dataset"),
         ("MISSING CELLS", f"{missing:,}", f"{missing/max(frame.size,1)*100:.1f}% dari seluruh sel"),
         ("DUPLICATE ROWS", f"{dup:,}", "Baris identik"),
@@ -218,7 +289,7 @@ def build_pdf(frame, report_title, selected_categories, primary_metric):
         ("LEFTPADDING",(0,0),(-1,-1),7),("RIGHTPADDING",(0,0),(-1,-1),5),
         ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),
     ]))
-    story += [kpi_table, Spacer(1, 5), Paragraph("AUDIENCE & DATA PROFILE", section_style)]
+    story += [kpi_table, Spacer(1, 5), Paragraph("CATEGORY & DATA PROFILE", section_style)]
 
     cats = selected_categories[:6]
     if not cats:
@@ -375,19 +446,78 @@ st.divider()
 st.header("② Apa yang ingin kamu ketahui dari data ini?")
 st.caption("Pilih salah satu kebutuhan. Aplikasi akan menampilkan analisis yang relevan tanpa perlu mengatur grafik satu per satu.")
 
-question_options = [
-    "Gambaran umum dataset",
-    "Profil audiens / pelanggan",
-    "Kategori atau segmen terbesar",
-    "Performa sebuah metrik",
-    "Tren berdasarkan waktu",
-    "Hubungan antarvariabel",
-    "Kualitas data dan anomali",
-    "Buat laporan eksekutif lengkap",
-]
-question = st.selectbox("Pilih jenis insight", question_options, key="insight_question")
+domain, domain_confidence, domain_scores = detect_business_context(df)
+metric_roles = infer_metric_roles(df, numeric_cols)
+auto_findings = build_auto_insights(df, numeric_cols, cat_cols, date_cols)
+
+st.markdown("### Dataset recognition")
+dc1, dc2, dc3 = st.columns([1.4, 1, 1])
+dc1.metric("Detected data context", domain)
+dc2.metric("Numeric variables", len(numeric_cols))
+dc3.metric("Category / text variables", len(cat_cols))
+st.caption("Klasifikasi otomatis berdasarkan nama kolom dan tipe data. Anggap sebagai rekomendasi awal; verifikasi konteks bisnis sebelum mengambil keputusan.")
+
+question_options = ["Automatic insights", "Gambaran umum dataset"]
+if cat_cols:
+    question_options += ["Profil kategori / segmen", "Profil audiens / pelanggan", "Kategori atau segmen terbesar"]
+if numeric_cols:
+    question_options += ["Performa metrik", "Perbandingan metrik berdasarkan segmen"]
+if date_cols and (numeric_cols or len(df)):
+    question_options += ["Tren berdasarkan waktu"]
+if len(numeric_cols) >= 2:
+    question_options += ["Hubungan antarvariabel"]
+question_options += ["Kualitas data dan anomali", "Buat laporan eksekutif lengkap"]
+question = st.selectbox("Apa yang ingin kamu ketahui?", question_options, key="insight_question")
+st.caption("Pilih satu kebutuhan. Aplikasi akan menampilkan analisis yang sesuai dengan kolom yang tersedia.")
 
 # Keep controls and analysis in the same clear guided area.
+if question == "Automatic insights":
+    st.subheader("Temuan awal yang terdeteksi otomatis")
+    st.caption("Insight ini bersifat deskriptif dan dihasilkan dari pola statistik dasar, bukan kesimpulan kausal.")
+    for title, detail, level in auto_findings:
+        if level == "warning":
+            st.warning(f"**{title}** — {detail}")
+        elif level == "success":
+            st.success(f"**{title}** — {detail}")
+        else:
+            st.info(f"**{title}** — {detail}")
+    if metric_roles:
+        detected_roles = {k: v for k, v in metric_roles.items() if v}
+        if detected_roles:
+            st.markdown("**Kandidat KPI berdasarkan nama kolom**")
+            role_rows = [{"Kandidat KPI": role, "Kolom terdeteksi": ", ".join(map(str, cols))} for role, cols in detected_roles.items()]
+            st.dataframe(pd.DataFrame(role_rows), use_container_width=True, hide_index=True)
+    st.markdown("**Rekomendasi eksplorasi berikutnya**")
+    suggestions = []
+    if cat_cols: suggestions.append("Profil kategori / segmen untuk melihat komposisi dan konsentrasi data.")
+    if numeric_cols: suggestions.append("Performa metrik untuk memahami skala, rata-rata, median, dan sebaran nilai.")
+    if date_cols and numeric_cols: suggestions.append("Tren berdasarkan waktu untuk mengidentifikasi pola temporal.")
+    if len(numeric_cols) >= 2: suggestions.append("Hubungan antarvariabel untuk memeriksa asosiasi antarindikator.")
+    for item in suggestions: st.markdown(f"- {item}")
+
+elif question == "Profil kategori / segmen":
+    st.subheader("Profil kategori / segmen")
+    selected_profile_cols = st.multiselect("Pilih dimensi yang ingin dibandingkan", cat_cols, default=cat_cols[:min(6,len(cat_cols))], max_selections=9, key="adaptive_profile_dims")
+    if selected_profile_cols:
+        chart_cols = st.columns(2)
+        for i, col in enumerate(selected_profile_cols):
+            summary = category_summary(df, col, 10)
+            with chart_cols[i % 2]:
+                st.markdown(f"**{col}**")
+                fig = px.bar(summary.sort_values("Jumlah"), x="Jumlah", y="Kategori", orientation="h", text=summary.sort_values("Jumlah")["Persentase"].map(lambda x: f"{x:.1f}%"), title=f"Distribusi {col}")
+                fig.update_layout(height=320, margin=dict(l=5,r=5,t=35,b=5))
+                st.plotly_chart(fig, use_container_width=True, key=f"adaptive_profile_chart_{i}")
+
+elif question == "Perbandingan metrik berdasarkan segmen":
+    st.subheader("Perbandingan metrik berdasarkan segmen")
+    metric = st.selectbox("Pilih KPI / metrik", numeric_cols, key="adaptive_compare_metric")
+    dimension = st.selectbox("Kelompokkan berdasarkan", cat_cols, key="adaptive_compare_dimension")
+    agg_label = st.selectbox("Cara perhitungan", ["Total", "Rata-rata", "Jumlah data"], key="adaptive_compare_agg")
+    agg_func = {"Total":"sum", "Rata-rata":"mean", "Jumlah data":"count"}[agg_label]
+    result = df.groupby(dimension, dropna=False)[metric].agg(agg_func).reset_index(name="Hasil").sort_values("Hasil", ascending=False).head(20)
+    st.plotly_chart(px.bar(result, x=dimension, y="Hasil", title=f"{agg_label} {metric} berdasarkan {dimension}"), use_container_width=True)
+    st.dataframe(result, use_container_width=True, hide_index=True)
+
 if question == "Gambaran umum dataset":
     st.subheader("Gambaran umum")
     st.dataframe(df.head(20), use_container_width=True)
@@ -445,7 +575,7 @@ elif question == "Kategori atau segmen terbesar":
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(summary, use_container_width=True, hide_index=True)
 
-elif question == "Performa sebuah metrik":
+elif question == "Performa metrik":
     st.subheader("Analisis metrik")
     if not numeric_cols:
         st.warning("Tidak ada kolom numerik.")
@@ -525,10 +655,10 @@ elif question == "Kualitas data dan anomali":
 # ------------------------------ Report builder -----------------------------
 st.divider()
 st.header("③ Buat laporan dan download")
-st.caption("Laporan visual mengikuti gaya Audience Overview Manado: latar navy gelap, aksen cyan, kartu KPI, distribusi kategori, dan executive signals.")
+st.caption("Laporan adaptif: KPI, profil kategori, metrik utama, dan executive signals disusun berdasarkan kolom yang tersedia pada dataset.")
 
 with st.container(border=True):
-    report_title = st.text_input("Judul laporan", value="AUDIENCE OVERVIEW — DATA SNAPSHOT", key="report_title_input")
+    report_title = st.text_input("Judul laporan", value=f"{domain.upper()} — EXECUTIVE DATA OVERVIEW", key="report_title_input")
     r1, r2 = st.columns(2)
     with r1:
         report_categories = st.multiselect(
@@ -540,9 +670,11 @@ with st.container(border=True):
             help="Contoh: gender, usia, pekerjaan, domisili, kanal promosi, preferensi brand."
         )
     with r2:
+        preferred_metrics = [c for role in ["Revenue / Value", "Volume / Count", "Rate / Percentage", "Duration / Time"] for c in metric_roles.get(role, [])]
+        preferred_metrics = list(dict.fromkeys(preferred_metrics + numeric_cols))
         report_metric = st.selectbox(
             "Metrik numerik utama (opsional)",
-            ["Tidak ada"] + numeric_cols,
+            ["Tidak ada"] + preferred_metrics,
             key="report_primary_metric",
         )
 
@@ -552,7 +684,7 @@ with st.container(border=True):
             pdf_bytes = build_pdf(df, report_title.strip() or "EXECUTIVE DATA OVERVIEW",
                                   report_categories, metric_arg)
             st.session_state["generated_pdf"] = pdf_bytes
-            st.session_state["generated_pdf_name"] = "executive_data_overview.pdf"
+            st.session_state["generated_pdf_name"] = "adaptive_executive_data_overview.pdf"
             st.success("Laporan PDF berhasil dibuat.")
         except Exception as exc:
             st.error(f"Gagal membuat PDF: {exc}")
@@ -561,7 +693,7 @@ with st.container(border=True):
         st.download_button(
             "⬇️ Download Executive Overview (PDF)",
             data=st.session_state["generated_pdf"],
-            file_name=st.session_state.get("generated_pdf_name","executive_data_overview.pdf"),
+            file_name=st.session_state.get("generated_pdf_name","adaptive_executive_data_overview.pdf"),
             mime="application/pdf",
             use_container_width=True,
             key="download_generated_pdf",
