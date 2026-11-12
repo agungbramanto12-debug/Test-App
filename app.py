@@ -123,10 +123,21 @@ def detect_business_context(frame: pd.DataFrame):
         "Operations & Productivity": ["duration", "durasi", "cycle time", "productivity", "produktivitas", "output", "downtime", "defect", "error", "sla", "completion", "completed", "status", "inventory", "stock"]
     }
     scores = {k: sum(1 for token in tokens if token in blob) for k, tokens in profiles.items()}
-    best = max(scores, key=scores.get)
-    if scores[best] == 0:
+
+    # Keep the winning score before applying the General fallback.
+    # "General Business Dataset" is not a key in `scores`, so looking it
+    # up there caused a KeyError for datasets with unrecognized columns.
+    detected_domain = max(scores, key=scores.get)
+    winning_score = scores[detected_domain]
+    total_score = sum(scores.values())
+
+    if winning_score == 0:
         best = "General Business Dataset"
-    confidence = scores[best] / max(sum(scores.values()), 1)
+        confidence = 0.0
+    else:
+        best = detected_domain
+        confidence = winning_score / max(total_score, 1)
+
     return best, confidence, scores
 
 
