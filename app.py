@@ -509,7 +509,7 @@ with tabs[1]:
             c1, c2, c3 = st.columns(3)
             x_col = c1.selectbox("Category", categorical_cols)
             y_col = c2.selectbox("Metric", numeric_cols, index=numeric_cols.index(selected_metric) if selected_metric in numeric_cols else 0)
-            agg = c3.selectbox("Aggregation", ["Sum", "Mean", "Count"])
+            agg = c3.selectbox("Aggregation", ["Sum", "Mean", "Count"], key="visual_category_aggregation")
             top_n = st.slider("Jumlah kategori yang ditampilkan", 5, 30, 15)
             work = df[[x_col, y_col]].dropna(subset=[x_col])
             if agg == "Sum":
@@ -689,7 +689,7 @@ with tabs[3]:
         c1, c2, c3 = st.columns(3)
         segment_col = c1.selectbox("Segment dimension", categorical_cols)
         metric_col = c2.selectbox("Performance metric", numeric_cols)
-        segment_agg = c3.selectbox("Aggregation", ["Sum", "Mean", "Count"])
+        segment_agg = c3.selectbox("Aggregation", ["Sum", "Mean", "Count"], key="visual_category_aggregation")
         segment_data = df[[segment_col, metric_col]].dropna(subset=[segment_col])
         if segment_agg == "Sum":
             seg = segment_data.groupby(segment_col)[metric_col].sum().rename("Value")
